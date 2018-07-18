@@ -18,6 +18,8 @@ _REGEX_FILENAME = regex.compile(
 _TIME_STEP = 1  # in seconds
 _EC_IN_WATER_CUTOFF = 100  # EC below this will be treated as if the boat is out of water
 _DANGER_VOLTAGE = 14  # show battery voltage above this value
+_VOLTAGE_MEDIAN_WINDOW = 10  # size of the window of previous voltage values to take the median of
+_VELOCITY_WINDOW = 50  # size of the window of previous pose values to use for velocity estimate
 
 
 def printNestedDict(dict_to_print, indent_level=0):
@@ -84,6 +86,10 @@ def parse(filename):
     current_pose = (0.0, 0.0)
     current_time = 0.0  # seconds
     time_since_accumulation = 0.0
+    voltage_median_window = [0.0] * _VOLTAGE_MEDIAN_WINDOW
+    pose_window = [[0.0, 0.0]]*_VELOCITY_WINDOW
+    time_window = [0]*_VELOCITY_WINDOW
+    velocity_initialized = False
 
     meta_data = {
         "time_elapsed_total": [0.0],
@@ -95,7 +101,11 @@ def parse(filename):
         "distance_traveled_rc": [0.0],
         "distance_traveled_auto": [0.0],
         "distance_from_home_location": [0.0],
+        "velocity_over_ground": [0.0],
+        "velocity_surge": [0.0],
+        "velocity_sway": [0.0],
         "battery_voltage": [0.0],
+        "battery_voltage_median": [0.0],
         "cumulative_motor_action_total": [0.0],
         "cumulative_motor_action_rc": [0.0],
         "cumulative_motor_action_auto": [0.0],
@@ -133,6 +143,20 @@ def parse(filename):
                         meta_data["distance_from_home_location"][-1] = dist(new_pose, home_pose)
                         distance_traveled = dist(new_pose, current_pose)
                         current_pose = new_pose
+                        del pose_window[0]
+                        del time_window[0]
+                        pose_window.append(new_pose)
+                        time_window.append(timestamp_seconds)
+                        # calculate velocity
+                        distance_easting = pose_window[-1][0] - pose_window[0][0]
+                        distance_northing = pose_window[-1][1] - pose_window[0][1]
+                        distance_over_ground = np.sqrt(np.power(distance_easting, 2) + np.power(distance_northing, 2))
+                        velocity_dt = time_window[-1] - time_window[0]
+                        if not velocity_initialized and time_window[0] != 0:
+                            velocity_initialized = True
+                        if velocity_initialized:
+                            meta_data["velocity_over_ground"][-1] = distance_over_ground/velocity_dt
+
                     if k == "home_pose":
                         m = _REGEX_FLOAT.findall(v)
                         home_pose = (float(m[0]), float(m[1]))
@@ -141,14 +165,21 @@ def parse(filename):
                     if v["type"] == "EC_GOSYS":
                         ec = v["data"]
                         if ec > _EC_IN_WATER_CUTOFF:
-                            if not in_water: print("Boat entered water at {}".format(timestamp_seconds))
+                            if not in_water:
+                                print("Boat entered water at {}".format(timestamp_seconds))
                             in_water = True
 
                         else:
-                            if in_water: print("Boat exited water at {}".format(timestamp_seconds))
+                            if in_water:
+                                print("Boat exited water at {}".format(timestamp_seconds))
                             in_water = False
                     if v["type"] == "BATTERY":
-                        meta_data["battery_voltage"][-1] = float(v["data"]) - _DANGER_VOLTAGE
+                        voltage_above_danger = float(v["data"]) - _DANGER_VOLTAGE
+                        meta_data["battery_voltage"][-1] = voltage_above_danger
+                        del voltage_median_window[0]
+                        voltage_median_window.append(voltage_above_danger)
+                        meta_data["battery_voltage_median"][-1] = np.median(voltage_median_window)
+
                 if k == "cmd":
                     # TODO: motor action
                     None
@@ -172,15 +203,26 @@ def parse(filename):
             raise ValueError("Aborted after invalid JSON log message '{:s}': {:s}".format(message, e))
 
     fig, ax1 = plt.subplots()
-    ax1.plot(meta_data["time_elapsed_total"], meta_data["battery_voltage"], 'r')
+    """
+    ax1.plot(meta_data["time_elapsed_total"], meta_data["battery_voltage_median"], 'r')
     ax1.set_xlabel('time (s)')
     ax1.set_ylabel('battery voltage above 14 V', color="r")
     ax1.tick_params('y', colors='r')
+    """
+    ax1.plot(meta_data["time_elapsed_total"], meta_data["distance_traveled_rc"], 'g')
+    ax1.set_xlabel('time (s)')
+    ax1.set_ylabel('distance traveled (m)', color="g")
+    ax1.tick_params('y', colors='g')
+
+    ax1.plot(meta_data["time_elapsed_total"], meta_data["distance_traveled_auto"], 'r')
+    ax1.set_xlabel('time (s)')
+    ax1.set_ylabel('distance traveled (m)', color="r")
+    ax1.tick_params('y', colors='r')
 
     ax2 = ax1.twinx()
-    ax2.plot(meta_data["time_elapsed_total"], meta_data["distance_traveled_total"], 'b')
+    ax2.plot(meta_data["time_elapsed_total"], meta_data["velocity_over_ground"], 'b')
     ax2.set_xlabel('time (s)')
-    ax2.set_ylabel('distance traveled (m)', color="b")
+    ax2.set_ylabel('velocity over ground (m/s)', color="b")
     ax2.tick_params('y', colors='b')
 
     plt.show()
