@@ -4,6 +4,7 @@ import re as regex
 import json
 import six
 import numpy as np
+import sklearn.linear_model as lm
 import matplotlib.pyplot as plt
 
 
@@ -15,10 +16,10 @@ _REGEX_FILENAME = regex.compile(
     r"_(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})"
     r".txt$")
 
-_TIME_STEP = 1  # in seconds
+_TIME_STEP = 10  # in seconds
 _EC_IN_WATER_CUTOFF = 100  # EC below this will be treated as if the boat is out of water
 _DANGER_VOLTAGE = 14  # show battery voltage above this value
-_VOLTAGE_MEDIAN_WINDOW = 10  # size of the window of previous voltage values to take the median of
+_VOLTAGE_MEDIAN_WINDOW = 500  # size of the window of previous voltage values to take the median of
 _VELOCITY_WINDOW = 50  # size of the window of previous pose values to use for velocity estimate
 
 
@@ -87,9 +88,13 @@ def parse(filename):
     current_time = 0.0  # seconds
     time_since_accumulation = 0.0
     voltage_median_window = [0.0] * _VOLTAGE_MEDIAN_WINDOW
+    voltage_time_window = [0]*_VOLTAGE_MEDIAN_WINDOW
+    voltage_drain_rate_initialized = False
     pose_window = [[0.0, 0.0]]*_VELOCITY_WINDOW
-    time_window = [0]*_VELOCITY_WINDOW
+    velocity_time_window = [0]*_VELOCITY_WINDOW
     velocity_initialized = False
+    first_easting = 0
+    first_northing = 0
 
     meta_data = {
         "time_elapsed_total": [0.0],
@@ -106,6 +111,7 @@ def parse(filename):
         "velocity_sway": [0.0],
         "battery_voltage": [0.0],
         "battery_voltage_median": [0.0],
+        "battery_voltage_drain_rate": [0.0],
         "cumulative_motor_action_total": [0.0],
         "cumulative_motor_action_rc": [0.0],
         "cumulative_motor_action_auto": [0.0],
@@ -122,6 +128,7 @@ def parse(filename):
         current_time = timestamp_seconds
         time_since_accumulation += dt
         if time_since_accumulation > _TIME_STEP:
+            print("Parsing, @ {:.1f} seconds".format(timestamp_seconds))
             time_since_accumulation = 0.0
             for k in meta_data:
                 meta_data[k].append(meta_data[k][-1])  # start with previous value
@@ -144,18 +151,37 @@ def parse(filename):
                         distance_traveled = dist(new_pose, current_pose)
                         current_pose = new_pose
                         del pose_window[0]
-                        del time_window[0]
+                        del velocity_time_window[0]
                         pose_window.append(new_pose)
-                        time_window.append(timestamp_seconds)
+                        velocity_time_window.append(timestamp_seconds)
                         # calculate velocity
+                        """
                         distance_easting = pose_window[-1][0] - pose_window[0][0]
                         distance_northing = pose_window[-1][1] - pose_window[0][1]
                         distance_over_ground = np.sqrt(np.power(distance_easting, 2) + np.power(distance_northing, 2))
                         velocity_dt = time_window[-1] - time_window[0]
-                        if not velocity_initialized and time_window[0] != 0:
+                        """
+                        if not velocity_initialized and velocity_time_window[0] != 0:
                             velocity_initialized = True
+                            first_easting = current_pose[0]
+                            first_northing = current_pose[1]
                         if velocity_initialized:
-                            meta_data["velocity_over_ground"][-1] = distance_over_ground/velocity_dt
+                            # meta_data["velocity_over_ground"][-1] = distance_over_ground/velocity_dt
+                            #  https://docs.scipy.org/doc/numpy-1.13.0/reference/generated/numpy.linalg.lstsq.html
+                            #  http://scikit-learn.org/stable/auto_examples/linear_model/plot_ransac.html
+                            pose_window_array = np.array(pose_window)
+                            pose_window_array[:, 0] -= first_easting
+                            pose_window_array[:, 1] -= first_northing
+                            #time_array = np.atleast_2d(np.array(time_window)-time_window[0]).T
+                            #ransac = lm.RANSACRegressor()
+                            #ransac.fit(time_array, pose_window_array)
+                            #vE = ransac.estimator_.coef_[0]
+                            #vN = ransac.estimator_.coef_[1]
+                            A = np.vstack([velocity_time_window, np.ones(pose_window_array.shape[0])]).T
+                            velE, _ = np.linalg.lstsq(A, pose_window_array[:, 0], rcond=None)[0]
+                            velN, _ = np.linalg.lstsq(A, pose_window_array[:, 1], rcond=None)[0]
+                            vel = np.sqrt(np.power(velE, 2) + np.power(velN, 2))
+                            meta_data["velocity_over_ground"][-1] = vel
 
                     if k == "home_pose":
                         m = _REGEX_FLOAT.findall(v)
@@ -177,8 +203,16 @@ def parse(filename):
                         voltage_above_danger = float(v["data"]) - _DANGER_VOLTAGE
                         meta_data["battery_voltage"][-1] = voltage_above_danger
                         del voltage_median_window[0]
+                        del voltage_time_window[0]
                         voltage_median_window.append(voltage_above_danger)
+                        voltage_time_window.append(timestamp_seconds)
                         meta_data["battery_voltage_median"][-1] = np.median(voltage_median_window)
+                        if not voltage_drain_rate_initialized and voltage_median_window[0] != 0:
+                            voltage_drain_rate_initialized = True
+                        if voltage_drain_rate_initialized:
+                            A = np.vstack([voltage_time_window, np.ones(len(voltage_time_window))]).T
+                            voltage_drain_rate, _ = np.linalg.lstsq(A, voltage_median_window, rcond=None)[0]
+                            meta_data["battery_voltage_drain_rate"][-1] = voltage_drain_rate*3600  # per HOUR
 
                 if k == "cmd":
                     # TODO: motor action
@@ -203,27 +237,30 @@ def parse(filename):
             raise ValueError("Aborted after invalid JSON log message '{:s}': {:s}".format(message, e))
 
     fig, ax1 = plt.subplots()
-    """
+
     ax1.plot(meta_data["time_elapsed_total"], meta_data["battery_voltage_median"], 'r')
     ax1.set_xlabel('time (s)')
     ax1.set_ylabel('battery voltage above 14 V', color="r")
     ax1.tick_params('y', colors='r')
+
+    ax2 = ax1.twinx()
+
     """
     ax1.plot(meta_data["time_elapsed_total"], meta_data["distance_traveled_rc"], 'g')
     ax1.set_xlabel('time (s)')
     ax1.set_ylabel('distance traveled (m)', color="g")
     ax1.tick_params('y', colors='g')
+    """
 
-    ax1.plot(meta_data["time_elapsed_total"], meta_data["distance_traveled_auto"], 'r')
-    ax1.set_xlabel('time (s)')
-    ax1.set_ylabel('distance traveled (m)', color="r")
-    ax1.tick_params('y', colors='r')
-
-    ax2 = ax1.twinx()
-    ax2.plot(meta_data["time_elapsed_total"], meta_data["velocity_over_ground"], 'b')
+    ax2.plot(meta_data["time_elapsed_total"], meta_data["battery_voltage_drain_rate"], 'kx')
     ax2.set_xlabel('time (s)')
-    ax2.set_ylabel('velocity over ground (m/s)', color="b")
-    ax2.tick_params('y', colors='b')
+    ax2.set_ylabel('battery drain rate (V/hr)', color="k")
+    ax2.tick_params('y', colors='k')
+
+    #ax2.plot(meta_data["time_elapsed_total"], meta_data["velocity_over_ground"], 'b')
+    #ax2.set_xlabel('time (s)')
+    #ax2.set_ylabel('velocity over ground (m/s)', color="b")
+    #ax2.tick_params('y', colors='b')
 
     plt.show()
 
@@ -235,7 +272,7 @@ if __name__ == "__main__":
         filename = args[0]
     else:
         print("YOU NEED TO INCLUDE FILENAME AS AN ARGUMENT. USING EXAMPLE FILE...")
-        filename = "/home/jason/Documents/INTCATCH/phone logs/Garda/platypus_20180712_040554.txt"
+        filename = "/home/jason/Documents/INTCATCH/phone logs/Laghetto del Frassino/platypus_20180720_033339.txt"
 
     parse(filename)
 
